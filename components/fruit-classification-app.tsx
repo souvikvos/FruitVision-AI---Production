@@ -939,7 +939,7 @@ export default function FruitClassificationApp() {
             </div>
             <span className={cn(
               "font-extrabold text-lg tracking-tight transition-all duration-300 origin-left overflow-hidden whitespace-nowrap",
-              isCollapsed ? "max-w-0 opacity-0 ml-0" : "max-w-[150px] opacity-100 ml-2"
+              isCollapsed ? "max-w-0 opacity-0 ml-0" : "max-w-[150px] opacity-100 ml-2 hidden sm:block"
             )}>
               Fruit Vision
             </span>
@@ -981,7 +981,7 @@ export default function FruitClassificationApp() {
                     isCollapsed ? "scale-110 opacity-100" : (isScrolled ? "scale-100 opacity-90" : "scale-100 opacity-80")
                   )} />
                   <span className={cn(
-                    "transition-all duration-300 origin-left overflow-hidden whitespace-nowrap",
+                    "hidden md:inline-block transition-all duration-300 origin-left overflow-hidden whitespace-nowrap",
                     isCollapsed ? "max-w-0 opacity-0" : "max-w-[100px] opacity-100"
                   )}>
                     {tab.label}
@@ -1487,7 +1487,7 @@ export default function FruitClassificationApp() {
                   </div>
                   
                   {/* Side-by-Side Images */}
-                  <div className="grid grid-cols-2 gap-4">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                     <div className="flex flex-col gap-2">
                       <p className="text-[10px] font-mono opacity-60 uppercase text-center">Input Specimen</p>
                       <div className="w-full aspect-[4/3] rounded-xl overflow-hidden relative border border-white/10 shadow-lg bg-black/40">
@@ -1676,7 +1676,7 @@ export default function FruitClassificationApp() {
                     </div>
                   </div>
 
-                  <div className="grid grid-cols-2 gap-6 mb-6">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-6 mb-6">
                     <div>
                       <p className="text-[11px] font-mono opacity-60 uppercase mb-1">Primary Match</p>
                       <p className="text-3xl font-black capitalize tracking-tight bg-gradient-to-r from-indigo-500 to-purple-500 bg-clip-text text-transparent">
