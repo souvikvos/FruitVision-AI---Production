@@ -22,10 +22,14 @@ import {
   ChevronDown,
   Search,
   Edit3,
-  Trash2
+  Trash2,
+  Scan,
+  Save
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { CpuArchitecture } from "./ui/cpu-architecture";
+import { detectFruit } from '@/lib/expert-system/logicEngine';
+import { runDetection, runClassification, initOnnxSessions } from '@/lib/onnxEngine';
 
 // Interface for predefined fruits in the classification system
 interface FruitSample {
@@ -33,6 +37,7 @@ interface FruitSample {
   name: string;
   scientificName: string;
   image: string;
+  originalImage?: string;
   ripeness: number; // percentage
   ripenessStage: "Underripe" | "Ripe" | "Overripe" | "Optimal";
   freshness: number; // percentage
@@ -136,8 +141,11 @@ export default function FruitClassificationApp() {
   const [selectedFruit, setSelectedFruit] = React.useState<FruitSample | null>(null);
   const [scanning, setScanning] = React.useState(false);
   const [scanStep, setScanStep] = React.useState(0);
+  const [yoloImageLoaded, setYoloImageLoaded] = React.useState(false);
+  const fileInputRef = React.useRef<HTMLInputElement>(null);
   const [customResult, setCustomResult] = React.useState<FruitSample | null>(null);
   const [prompt, setPrompt] = React.useState("");
+  const [expertResult, setExpertResult] = React.useState<any>(null);
   const [selectedModel, setSelectedModel] = React.useState<"classification" | "detection">("classification");
   const [showModelDropdown, setShowModelDropdown] = React.useState(false);
   const [activeTab, setActiveTab] = React.useState("generate");
@@ -153,6 +161,7 @@ export default function FruitClassificationApp() {
     date?: string; // Legacy support
     contextFruit?: FruitSample;
   }>>([]);
+  const [savedFruits, setSavedFruits] = React.useState<Array<{ name: string; date: string; timestamp: number }>>([]);
 
   const formatTimeAgo = (ts?: number, legacyDate?: string) => {
     if (!ts) return legacyDate || "Just now";
@@ -172,6 +181,10 @@ export default function FruitClassificationApp() {
         // eslint-disable-next-line react-hooks/set-state-in-effect
         setRecentSearches(JSON.parse(saved));
       }
+      const savedFruitsData = localStorage.getItem("fruitvision_saved_fruits");
+      if (savedFruitsData) {
+        setSavedFruits(JSON.parse(savedFruitsData));
+      }
     } catch (e) {
       console.error("Failed to load chat history", e);
     }
@@ -189,6 +202,18 @@ export default function FruitClassificationApp() {
       console.error("Failed to save chat history", e);
     }
   }, [recentSearches]);
+
+  React.useEffect(() => {
+    try {
+      if (savedFruits.length > 0) {
+        localStorage.setItem("fruitvision_saved_fruits", JSON.stringify(savedFruits));
+      } else {
+        localStorage.removeItem("fruitvision_saved_fruits");
+      }
+    } catch (e) {
+      console.error("Failed to save fruits", e);
+    }
+  }, [savedFruits]);
   const isCollapsed = isScrolled && !isNavHovered;
 
 
@@ -214,6 +239,15 @@ export default function FruitClassificationApp() {
   const [cameraStream, setCameraStream] = React.useState<MediaStream | null>(null);
   const [cameraError, setCameraError] = React.useState<string | null>(null);
   const videoRef = React.useRef<HTMLVideoElement | null>(null);
+  const canvasRef = React.useRef<HTMLCanvasElement | null>(null);
+  const [isLiveScanning, setIsLiveScanning] = React.useState(false);
+  const [liveClassResult, setLiveClassResult] = React.useState<{className: string, confidence: number} | null>(null);
+  const animationRef = React.useRef<number | null>(null);
+  
+  // Initialize ONNX on mount
+  React.useEffect(() => {
+    initOnnxSessions().catch(console.error);
+  }, []);
 
   const startCamera = async () => {
     setCameraError(null);
@@ -236,12 +270,82 @@ export default function FruitClassificationApp() {
   };
 
   const stopCamera = () => {
+    setIsLiveScanning(false);
+    if (animationRef.current) cancelAnimationFrame(animationRef.current);
     if (cameraStream) {
       cameraStream.getTracks().forEach(track => track.stop());
       setCameraStream(null);
     }
     setShowCameraModal(false);
   };
+
+  const toggleLiveScan = () => {
+    setIsLiveScanning(prev => !prev);
+  };
+
+  // Inference Loop
+  React.useEffect(() => {
+    if (!isLiveScanning || !videoRef.current || !canvasRef.current || !cameraStream) {
+      if (animationRef.current) cancelAnimationFrame(animationRef.current);
+      if (canvasRef.current) {
+        const ctx = canvasRef.current.getContext('2d');
+        if (ctx) ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+      }
+      setLiveClassResult(null);
+      return;
+    }
+
+    let isProcessing = false;
+
+    const loop = async () => {
+      if (!isProcessing && videoRef.current && canvasRef.current && videoRef.current.readyState >= 2) {
+        isProcessing = true;
+        
+        try {
+          if (selectedModel === "detection") {
+             const boxes = await runDetection(videoRef.current, canvasRef.current);
+             const ctx = canvasRef.current.getContext('2d');
+             if (ctx) {
+                 ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+                 boxes.forEach(box => {
+                     // Draw Box
+                     ctx.strokeStyle = '#34d399'; // Emerald 400
+                     ctx.lineWidth = 3;
+                     ctx.strokeRect(box.x1, box.y1, box.x2 - box.x1, box.y2 - box.y1);
+                     
+                     // Draw Background for text
+                     ctx.fillStyle = '#34d399';
+                     const text = `${box.className} ${(box.confidence * 100).toFixed(0)}%`;
+                     ctx.font = 'bold 16px Inter, sans-serif';
+                     const textWidth = ctx.measureText(text).width;
+                     ctx.fillRect(box.x1, box.y1 - 24, textWidth + 8, 24);
+                     
+                     // Draw Text
+                     ctx.fillStyle = '#000000';
+                     ctx.fillText(text, box.x1 + 4, box.y1 - 6);
+                 });
+             }
+          } else {
+             const result = await runClassification(videoRef.current);
+             setLiveClassResult(result);
+             const ctx = canvasRef.current.getContext('2d');
+             if (ctx) ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height); // clear boxes if any
+          }
+        } catch (err) {
+          console.error("Inference Error:", err);
+        } finally {
+          isProcessing = false;
+        }
+      }
+      animationRef.current = requestAnimationFrame(loop);
+    };
+
+    animationRef.current = requestAnimationFrame(loop);
+
+    return () => {
+      if (animationRef.current) cancelAnimationFrame(animationRef.current);
+    };
+  }, [isLiveScanning, selectedModel, cameraStream]);
 
   const handleCapture = () => {
     // Select a random sample to simulate snapshot scan completion!
@@ -264,8 +368,8 @@ export default function FruitClassificationApp() {
       document.getElementById("scanner")?.scrollIntoView({ behavior: "smooth" });
     } else if (tabId === "saved") {
       setShowSavedModal(true);
-    } else if (tabId === "feedback") {
-      window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
+    } else if (tabId === "info") {
+      document.getElementById("info")?.scrollIntoView({ behavior: "smooth" });
     }
   };
 
@@ -305,23 +409,21 @@ export default function FruitClassificationApp() {
          setCustomResult(null);
        }
     } else {
-       // Normal Text Search (if no context exists)
-       if (!currentContext) {
-         const query = queryText.toLowerCase();
-         let matchedSample = FRUIT_SAMPLES[0]; // Honeycrisp Apple
-         if (query.includes("banana")) {
-           matchedSample = FRUIT_SAMPLES[1];
-         } else if (query.includes("mango")) {
-           matchedSample = FRUIT_SAMPLES[2];
-         } else if (query.includes("straw") || query.includes("berry")) {
-           matchedSample = FRUIT_SAMPLES[3];
-         } else if (query.includes("pineapple") || query.includes("pine")) {
-           matchedSample = FRUIT_SAMPLES[4];
-         }
-         setSelectedFruit(matchedSample);
-         setCustomResult(null);
-       }
+       // Normal Text Search
+       setCustomResult(null);
+       setSelectedFruit(null);
+       const aiResult = detectFruit(queryText);
+       
+       // Simulate inference delay
+       setTimeout(() => {
+         setExpertResult(aiResult);
+       }, 1200);
     }
+    
+    // Stop scanner after UI animation finishes
+    setTimeout(() => {
+      setScanning(false);
+    }, 2500);
 
     // Smooth scroll to diagnostic console
     setTimeout(() => {
@@ -371,9 +473,9 @@ export default function FruitClassificationApp() {
         const pageHeight = document.documentElement.scrollHeight;
         const windowHeight = window.innerHeight;
         
-        // If near bottom of the page, active is feedback
+        // If near bottom of the page, active is info
         if (scrollPos + windowHeight >= pageHeight - 150) {
-          setActiveTab("feedback");
+          setActiveTab("info");
         }
         // If scrolled past scanner top threshold
         else if (scrollPos >= scannerTop) {
@@ -426,9 +528,6 @@ export default function FruitClassificationApp() {
       setTimeout(() => setScanStep(3), 1800),
       setTimeout(() => {
         setScanStep(4);
-        setScanning(false);
-
-
       }, 2500)
     ];
 
@@ -441,23 +540,32 @@ export default function FruitClassificationApp() {
     setSelectedFruit(sample);
     setScanStep(0);
     setScanning(true);
+    setTimeout(() => {
+      setScanning(false);
+    }, 2500);
   };
 
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (scanning) return;
     const file = e.target.files?.[0];
     if (!file) return;
 
+    // Reset input value to allow re-uploading the same file reliably
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+    }
+
     const reader = new FileReader();
-    reader.onload = () => {
+    reader.onload = async () => {
       setSelectedFruit(null);
+      const base64Image = reader.result as string;
       
-      // Seed a random mock result for custom uploads
       const seedFruit: FruitSample = {
         id: "custom-upload",
-        name: "Wild Organics Variety",
-        scientificName: "Fructus indeterminatus",
-        image: reader.result as string,
+        name: "Detecting...",
+        scientificName: "Analyzing...",
+        image: base64Image,
+        originalImage: base64Image,
         ripeness: Math.floor(Math.random() * 20) + 75,
         ripenessStage: "Optimal",
         freshness: Math.floor(Math.random() * 10) + 88,
@@ -466,16 +574,110 @@ export default function FruitClassificationApp() {
         storageTemp: "4°C - 6°C",
         shelfLife: "7 Days",
         exportQuality: Math.random() > 0.3,
-        notes: "Uploaded specimen detected. High cellular density. Minimal skin deformation observed."
+        notes: "Scanning with AI Model..."
       };
+      
+      setExpertResult({
+        fruit: "Thinking...",
+        confidence: 0,
+        score: 0,
+        topMatches: [],
+        recommendation: "Awaiting AI inference..."
+      });
       
       setCustomResult(seedFruit);
       setScanStep(0);
       setScanning(true);
+      setYoloImageLoaded(false);
+
+      try {
+        const endpoint = selectedModel === "detection" ? '/api/detect' : '/api/classify';
+        const response = await fetch(endpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ image: base64Image })
+        });
+        const result = await response.json();
+        
+        if (result.success && result.data && result.data.length > 0) {
+            let detectedName = "Unknown";
+            let yoloConfidence = 0;
+            let resultImageUrl = base64Image;
+
+            if (selectedModel === "detection" && result.data.length >= 2) {
+                const imageOutput = result.data[0];
+                if (imageOutput && imageOutput.url) resultImageUrl = imageOutput.url;
+
+                const textOutput = result.data[1];
+                if (typeof textOutput === "string") {
+                    const match = textOutput.match(/•\s*([a-zA-Z\s]+)\s*\(([0-9.]+)%\)/);
+                    if (match) {
+                        detectedName = match[1].trim();
+                        yoloConfidence = parseFloat(match[2]);
+                    } else {
+                        detectedName = textOutput.replace(/[^a-zA-Z\s]/g, '').trim() || "Unknown";
+                        yoloConfidence = 85;
+                    }
+                } else if (typeof textOutput === "object" && textOutput !== null) {
+                    if ('label' in textOutput) {
+                        detectedName = (textOutput as any).label;
+                    } else {
+                        detectedName = "Fruit Detected"; 
+                        yoloConfidence = 90;
+                    }
+                }
+            } else {
+                const prediction = result.data[0];
+                if (typeof prediction === "string") {
+                    detectedName = prediction;
+                    const fruitMatch = prediction.match(/Fruit:\s*([a-zA-Z\s]+)/i);
+                    const confMatch = prediction.match(/Confidence:\s*([0-9.]+)/i);
+                    if (fruitMatch) detectedName = fruitMatch[1].trim();
+                    if (confMatch) yoloConfidence = parseFloat(confMatch[1]);
+                } else if (prediction?.label) {
+                    detectedName = prediction.label;
+                    if (prediction.confidence !== undefined) yoloConfidence = prediction.confidence <= 1 ? prediction.confidence * 100 : prediction.confidence;
+                } else if (Array.isArray(prediction) && prediction[0]?.label) {
+                    detectedName = prediction[0].label;
+                    if (prediction[0].confidence !== undefined) yoloConfidence = prediction[0].confidence <= 1 ? prediction[0].confidence * 100 : prediction[0].confidence;
+                } else if (prediction?.confidences && prediction.confidences.length > 0) {
+                    detectedName = prediction.confidences[0].label;
+                    if (prediction.confidences[0].confidence !== undefined) yoloConfidence = prediction.confidences[0].confidence <= 1 ? prediction.confidences[0].confidence * 100 : prediction.confidences[0].confidence;
+                } else {
+                    detectedName = typeof prediction === 'object' ? "Detected Object" : String(prediction);
+                }
+                
+                if (yoloConfidence === 0 && typeof prediction === 'object' && prediction !== null) {
+                    const obj = Array.isArray(prediction) ? prediction[0] : prediction;
+                    if (obj?.score !== undefined) yoloConfidence = obj.score <= 1 ? obj.score * 100 : obj.score;
+                }
+            }
+            
+            const aiResult = detectFruit(detectedName);
+            setExpertResult(aiResult);
+            
+            setCustomResult(prev => prev ? { 
+              ...prev, 
+              image: resultImageUrl,
+              originalImage: base64Image,
+              name: detectedName, 
+              scientificName: `Confirmed by ${selectedModel === "detection" ? "YOLOv8" : "AI Classifier"}`, 
+              notes: "AI Inference complete.",
+              ripeness: yoloConfidence > 0 ? yoloConfidence : 0 
+            } : null);
+        } else {
+            setCustomResult(prev => prev ? { ...prev, name: "Classification Failed", scientificName: "Check API Token", originalImage: base64Image } : null);
+            setExpertResult(null);
+        }
+      } catch (err) {
+        setCustomResult(prev => prev ? { ...prev, name: "Network Error", scientificName: "Server Unreachable", originalImage: base64Image } : null);
+        setExpertResult(null);
+      } finally {
+        setScanning(false);
+      }
     };
     reader.readAsDataURL(file);
   };
-
   const activeData = customResult || selectedFruit;
 
   return (
@@ -756,7 +958,7 @@ export default function FruitClassificationApp() {
               { id: "home", label: "Home", icon: Home },
               { id: "generate", label: "Generate", icon: Cpu },
               { id: "saved", label: "Saved", icon: History },
-              { id: "feedback", label: "Feedback", icon: MessageSquare }
+              { id: "info", label: "Model Info", icon: Info }
             ].map((tab) => {
               const IconComponent = tab.icon;
               return (
@@ -1032,6 +1234,10 @@ export default function FruitClassificationApp() {
                             onClick={() => {
                               setSelectedModel("classification");
                               setShowModelDropdown(false);
+                              setCustomResult(null);
+                              setExpertResult(null);
+                              setSelectedFruit(null);
+                              setPrompt("");
                             }}
                             className={cn(
                               "relative flex items-start gap-3 p-3.5 rounded-2xl text-left transition-all cursor-pointer group outline-none",
@@ -1061,6 +1267,10 @@ export default function FruitClassificationApp() {
                             onClick={() => {
                               setSelectedModel("detection");
                               setShowModelDropdown(false);
+                              setCustomResult(null);
+                              setExpertResult(null);
+                              setSelectedFruit(null);
+                              setPrompt("");
                             }}
                             className={cn(
                               "relative flex items-start gap-3 p-3.5 rounded-2xl text-left transition-all cursor-pointer group outline-none",
@@ -1176,69 +1386,36 @@ export default function FruitClassificationApp() {
                   {/* File Selector */}
                   <input
                     type="file"
+                    ref={fileInputRef}
                     accept="image/*"
+                    onClick={(e) => { (e.target as HTMLInputElement).value = ''; }}
                     onChange={handleFileUpload}
                     className="absolute inset-0 opacity-0 cursor-pointer z-20"
                     disabled={scanning}
                   />
 
-                  {activeData ? (
-                    <div className="w-full h-full relative flex items-center justify-center bg-black/10">
-                      {/* Image render */}
-                      {/* Since we don't have real full files locally, we map standard placeholders or custom base64 */}
-                      <div className="w-full h-full flex items-center justify-center p-4">
-                        {/* Render standard vector graphic representation of the fruit */}
-                        <div className={cn(
-                          "w-48 h-48 rounded-full blur-[10px] opacity-15 absolute",
-                          activeData.id === "apple" && "bg-red-500",
-                          activeData.id === "banana" && "bg-yellow-400",
-                          activeData.id === "mango" && "bg-amber-400",
-                          activeData.id === "strawberry" && "bg-rose-500",
-                          activeData.id === "pineapple" && "bg-orange-400",
-                          activeData.id === "custom-upload" && "bg-purple-500"
-                        )} />
-                        
-                        <div className="flex flex-col items-center justify-center text-center z-10 p-6">
-                          {activeData.id === "custom-upload" ? (
-                            <Upload className="w-16 h-16 text-emerald-400 mb-2" />
-                          ) : (
-                            <span className="text-8xl mb-2 select-none filter drop-shadow-md">
-                              {activeData.id === "apple" && "🍎"}
-                              {activeData.id === "banana" && "🍌"}
-                              {activeData.id === "mango" && "🥭"}
-                              {activeData.id === "strawberry" && "🍓"}
-                              {activeData.id === "pineapple" && "🍍"}
-                            </span>
-                          )}
-                          <p className="font-bold text-lg">{activeData.name}</p>
-                          <p className="text-xs font-mono opacity-60 italic">{activeData.scientificName}</p>
-                        </div>
-                      </div>
-
-                      {/* Scanning Laser Beam Effect */}
-                      <AnimatePresence>
-                        {scanning && (
-                          <motion.div 
-                            initial={{ top: "0%" }}
-                            animate={{ top: "98%" }}
-                            exit={{ opacity: 0 }}
-                            transition={{ duration: 1.2, repeat: Infinity, repeatType: "reverse", ease: "easeInOut" }}
-                            className="absolute left-0 right-0 h-1 bg-gradient-to-r from-transparent via-emerald-400 to-transparent shadow-lg shadow-emerald-400/80 z-10"
-                          />
-                        )}
-                      </AnimatePresence>
-                    </div>
-                  ) : (
+                  {/* Always show the simple Upload Box UI */}
+                  <div className="w-full h-full relative flex items-center justify-center">
                     <div className="flex flex-col items-center gap-4 text-center p-6 pointer-events-none">
                       <div className="w-16 h-16 rounded-full bg-emerald-500/10 flex items-center justify-center text-emerald-400 group-hover:scale-105 transition-transform duration-300">
                         <Upload className="w-7 h-7" />
                       </div>
                       <div>
-                        <p className="font-semibold text-sm">Drag and drop file here, or click to upload</p>
+                        <p className="font-semibold text-sm">Upload Specimen Image</p>
                         <p className="text-xs opacity-50 mt-1">Supports PNG, JPG, or agricultural raw formats</p>
                       </div>
                     </div>
-                  )}
+
+                    {/* Scanning Laser Beam Effect */}
+                    {scanning && (
+                      <motion.div 
+                        initial={{ top: "0%" }}
+                        animate={{ top: "98%" }}
+                        transition={{ duration: 1.2, repeat: Infinity, repeatType: "reverse", ease: "easeInOut" }}
+                        className="absolute left-0 right-0 h-1 bg-gradient-to-r from-transparent via-emerald-400 to-transparent shadow-lg shadow-emerald-400/80 z-30 pointer-events-none"
+                      />
+                    )}
+                  </div>
 
                   {/* Overlaid scanning state banner */}
                   <AnimatePresence>
@@ -1287,190 +1464,293 @@ export default function FruitClassificationApp() {
             onMouseLeave={() => setDashboardTilt({ x: 0, y: 0 })}
             className="lg:col-span-5 flex flex-col gap-6"
           >
-            <AnimatePresence mode="wait">
-              {activeData && !scanning ? (
+            {customResult && !scanning && selectedModel === "detection" ? (
+                // --- NEW DETECTION SIDE-BY-SIDE UI ---
                 <motion.div
+                  key="detection-layout"
                   initial={{ opacity: 0, x: 20 }}
                   animate={{ opacity: 1, x: 0 }}
                   exit={{ opacity: 0, x: 20 }}
                   transition={{ duration: 0.5 }}
                   className={cn(
-                    "p-6 rounded-3xl border backdrop-blur-xl relative overflow-hidden transition-all duration-500 shadow-[0_8px_32px_0_rgba(0,0,0,0.15)]",
+                    "p-6 rounded-3xl border backdrop-blur-xl relative overflow-hidden transition-all duration-500 shadow-[0_8px_32px_0_rgba(0,0,0,0.15)] flex flex-col gap-6",
                     isDark 
-                      ? "bg-[#0b0c17]/50 border-white/[0.08] hover:border-white/[0.12]" 
-                      : "bg-white/40 border-white/30 hover:border-white/50 shadow-slate-200/50"
+                      ? "bg-[#0b0c17]/50 border-white/[0.08]" 
+                      : "bg-white/40 border-white/30"
                   )}
                 >
-                  <div className="flex items-start justify-between gap-4 mb-6">
-                    <div>
-                      <h3 className="text-xl font-bold">{activeData.name}</h3>
-                      <p className="text-xs font-mono opacity-50 italic">{activeData.scientificName}</p>
+                  <div className="flex items-center gap-2 mb-2">
+                    <Scan className="w-5 h-5 text-emerald-400" />
+                    <h3 className="text-lg font-bold">Detection Results</h3>
+                  </div>
+                  
+                  {/* Side-by-Side Images */}
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="flex flex-col gap-2">
+                      <p className="text-[10px] font-mono opacity-60 uppercase text-center">Input Specimen</p>
+                      <div className="w-full aspect-[4/3] rounded-xl overflow-hidden relative border border-white/10 shadow-lg bg-black/40">
+                        <img 
+                          src={customResult.originalImage || customResult.image} 
+                          alt="Original Specimen" 
+                          className="w-full h-full object-cover"
+                        />
+                      </div>
                     </div>
-                    {activeData.exportQuality ? (
-                      <span className="px-3 py-1 rounded-full text-[10px] font-mono font-bold bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 flex items-center gap-1">
-                        <ShieldCheck className="w-3.5 h-3.5" /> EXPORT READY
-                      </span>
-                    ) : (
-                      <span className="px-3 py-1 rounded-full text-[10px] font-mono font-bold bg-rose-500/10 border border-rose-500/20 text-rose-400 flex items-center gap-1">
-                        <AlertCircle className="w-3.5 h-3.5" /> DOMESTIC ONLY
-                      </span>
+                    
+                    <div className="flex flex-col gap-2">
+                      <p className="text-[10px] font-mono opacity-60 uppercase text-center text-emerald-400">YOLOv8 Output</p>
+                      <div className="w-full aspect-[4/3] rounded-xl overflow-hidden relative border border-emerald-500/20 shadow-[0_0_15px_rgba(52,211,153,0.1)] bg-black/40">
+                        {/* Placeholder while loading */}
+                        {!yoloImageLoaded && (
+                          <div className="absolute inset-0 flex flex-col items-center justify-center bg-[#0b0c17]/80 z-10">
+                            <div className="w-8 h-8 rounded-full border-2 border-emerald-500/30 border-t-emerald-400 animate-spin mb-3" />
+                            <p className="text-[10px] font-mono text-emerald-400/70 uppercase">Receiving YOLOv8 Output...</p>
+                          </div>
+                        )}
+                        <motion.img 
+                          src={customResult.image} 
+                          alt="Detected Specimen" 
+                          className="w-full h-full object-cover relative z-0"
+                          initial={{ filter: "blur(20px)", scale: 1.1, opacity: 0 }}
+                          animate={yoloImageLoaded ? { filter: "blur(0px)", scale: 1, opacity: 1 } : { filter: "blur(20px)", scale: 1.1, opacity: 0 }}
+                          transition={{ duration: 1.2, ease: "easeOut" }}
+                          onLoad={() => setYoloImageLoaded(true)}
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="bg-emerald-500/10 border border-emerald-500/20 rounded-xl p-4 mt-2">
+                    <p className="text-xs font-mono opacity-70 uppercase mb-1">Primary Detection Match</p>
+                    <div className="flex items-center justify-between">
+                      <p className="text-2xl font-black capitalize tracking-tight text-emerald-400">{customResult.name}</p>
+                      {(customResult.ripeness || 0) > 0 && (
+                        <div className="text-right">
+                          <p className="text-[10px] font-mono opacity-60 uppercase text-emerald-400">Confidence</p>
+                          <p className="text-xl font-bold text-emerald-400 tracking-tight">{Math.round(customResult.ripeness)}%</p>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  <button
+                    onClick={() => {
+                      const sample = customResult || selectedFruit;
+                      if (!sample) return;
+                      const newItem = {
+                        name: `${sample.name || "Unknown Fruit"} ✅`,
+                        date: new Date().toLocaleDateString() + ", " + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+                        timestamp: Date.now()
+                      };
+                      setSavedFruits(prev => {
+                        if (prev.some(p => p.name === newItem.name && p.timestamp === newItem.timestamp)) return prev;
+                        return [newItem, ...prev];
+                      });
+                      setShowSavedModal(true);
+                    }}
+                    className={cn("w-full py-3 mt-2 rounded-xl text-sm font-bold border transition-colors flex items-center justify-center gap-2",
+                      isDark ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-400 hover:bg-emerald-500/20" : "bg-emerald-50 border-emerald-200 text-emerald-600 hover:bg-emerald-100"
+                    )}
+                  >
+                    <Save className="w-4 h-4" /> Save Result to Dashboard
+                  </button>
+                </motion.div>
+              ) : (customResult || selectedFruit) && !scanning ? (
+                // --- IMAGE UPLOAD / CLASSIC CLASSIFICATION LAYOUT ---
+                <motion.div
+                  key="image-upload-layout"
+                  initial={{ opacity: 0, x: 20 }}
+                  animate={{ opacity: 1, x: 0 }}
+                  exit={{ opacity: 0, x: 20 }}
+                  transition={{ duration: 0.5 }}
+                  className={cn(
+                    "p-6 rounded-3xl border backdrop-blur-xl relative overflow-hidden transition-all duration-500 shadow-[0_8px_32px_0_rgba(0,0,0,0.15)] flex flex-col gap-6",
+                    isDark 
+                      ? "bg-[#0b0c17]/50 border-white/[0.08]" 
+                      : "bg-white/40 border-white/30"
+                  )}
+                >
+                  {(customResult || selectedFruit)?.image && (
+                    <div className="w-full aspect-video rounded-2xl overflow-hidden relative border border-white/10 shadow-lg bg-black/40">
+                      <motion.img 
+                        src={(customResult || selectedFruit)?.image} 
+                        alt="Specimen" 
+                        className="w-full h-full object-cover"
+                        initial={{ filter: "blur(24px)", scale: 1.1, opacity: 0 }}
+                        animate={{ filter: "blur(0px)", scale: 1, opacity: 1 }}
+                        transition={{ duration: 1.2, ease: "easeOut", delay: 0.1 }}
+                      />
+                      <div className="absolute top-3 right-3 bg-black/60 backdrop-blur-md px-3 py-1 rounded-full border border-white/10 text-[10px] font-mono tracking-widest text-white flex items-center gap-1.5 shadow-xl">
+                        <Scan className="w-3 h-3 text-emerald-400" /> SCANNED SPECIMEN
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="flex items-start justify-between gap-4">
+                    <div>
+                      <h3 className="text-xl font-bold">{(customResult || selectedFruit)?.name || "Unknown"}</h3>
+                      <p className="text-xs font-mono opacity-50 italic">{(customResult || selectedFruit)?.scientificName || "AI Detected Species"}</p>
+                    </div>
+                    {((customResult || selectedFruit)?.ripeness || 0) > 0 && (
+                      <div className="text-right">
+                        <p className="text-[10px] font-mono opacity-60 uppercase text-emerald-400">Confidence</p>
+                        <p className="text-2xl font-black text-emerald-400 tracking-tight">
+                          {Math.round((customResult || selectedFruit)?.ripeness || 0)}%
+                        </p>
+                      </div>
                     )}
                   </div>
 
-                  {/* Circular Ripeness Gauge Chart */}
-                  <div className="flex flex-col items-center justify-center p-4 border-b border-dashed border-slate-700/20 mb-6">
-                    <div className="relative w-36 h-36 flex items-center justify-center">
-                      <svg className="w-full h-full transform -rotate-90" viewBox="0 0 100 100">
-                        {/* Gray track ring */}
-                        <circle
-                          cx="50"
-                          cy="50"
-                          r="42"
-                          stroke={isDark ? "#ffffff" : "#0f172a"}
-                          strokeWidth="8"
-                          fill="transparent"
-                          className="opacity-10"
-                        />
-                        {/* Progress ring with gradient coloring */}
-                        <motion.circle
-                          cx="50"
-                          cy="50"
-                          r="42"
-                          stroke="url(#gradientRipeness)"
-                          strokeWidth="8"
-                          fill="transparent"
-                          strokeDasharray={263.89}
-                          initial={{ strokeDashoffset: 263.89 }}
-                          animate={{ strokeDashoffset: 263.89 - (263.89 * activeData.ripeness) / 100 }}
-                          transition={{ duration: 1.2, ease: "easeOut" }}
-                          strokeLinecap="round"
-                        />
-                        <defs>
-                          <linearGradient id="gradientRipeness" x1="0%" y1="0%" x2="100%" y2="100%">
-                            <stop offset="0%" stopColor="#34d399" />
-                            <stop offset="50%" stopColor="#fbbf24" />
-                            <stop offset="100%" stopColor="#f87171" />
-                          </linearGradient>
-                        </defs>
-                      </svg>
-                      {/* Concentric text */}
-                      <div className="absolute text-center">
-                        <span className="text-3xl font-black tracking-tight">{activeData.ripeness}%</span>
-                        <p className="text-[10px] font-bold tracking-widest opacity-60 uppercase mt-0.5">{activeData.ripenessStage}</p>
+                  {expertResult?.topMatches && expertResult.topMatches.length > 0 && (
+                    <div className="bg-white/5 dark:bg-black/20 rounded-xl p-3 border border-indigo-500/10">
+                      <p className="text-[10px] font-mono opacity-60 uppercase mb-2 flex items-center gap-1">
+                        <TrendingUp className="w-3 h-3" /> Top AI Matches
+                      </p>
+                      <div className="flex flex-wrap gap-2">
+                        {expertResult.topMatches.map((match: any, i: number) => (
+                          <div key={i} className="flex items-center gap-1.5 bg-indigo-500/10 px-2.5 py-1 rounded-md text-xs">
+                            <span className="font-semibold capitalize">{match.fruit}</span>
+                            <span className="opacity-50 text-[10px]">{match.score} pts</span>
+                          </div>
+                        ))}
                       </div>
                     </div>
-                    <span className="text-[11px] font-mono opacity-50 mt-3 text-center">RIPENESS INDEX METRIC</span>
-                  </div>
+                  )}
 
-                  {/* Visual Parameters Lists */}
-                  <div className="flex flex-col gap-4 mb-6">
-                    <div>
-                      <div className="flex justify-between text-xs font-semibold mb-1">
-                        <span>Freshness Rating</span>
-                        <span className="text-emerald-400">{activeData.freshness}%</span>
-                      </div>
-                      <div className={cn("w-full h-2 rounded-full overflow-hidden", isDark ? "bg-white/10" : "bg-slate-100")}>
-                        <motion.div 
-                          className="h-full bg-emerald-400 rounded-full" 
-                          initial={{ width: 0 }} 
-                          animate={{ width: `${activeData.freshness}%` }}
-                          transition={{ duration: 0.8, delay: 0.1 }}
-                        />
-                      </div>
-                    </div>
-
-                    <div>
-                      <div className="flex justify-between text-xs font-semibold mb-1">
-                        <span>Brix Sugar Concentration</span>
-                        <span className="text-amber-400">{activeData.brixLevel} °Bx</span>
-                      </div>
-                      <div className={cn("w-full h-2 rounded-full overflow-hidden", isDark ? "bg-white/10" : "bg-slate-100")}>
-                        <motion.div 
-                          className="h-full bg-amber-400 rounded-full" 
-                          initial={{ width: 0 }} 
-                          animate={{ width: `${(activeData.brixLevel / 20) * 100}%` }}
-                          transition={{ duration: 0.8, delay: 0.2 }}
-                        />
-                      </div>
-                    </div>
-
-                    <div>
-                      <div className="flex justify-between text-xs font-semibold mb-1">
-                        <span>Bruise & Tissue Damage Index</span>
-                        <span className="text-rose-400">{activeData.bruiseIndex}%</span>
-                      </div>
-                      <div className={cn("w-full h-2 rounded-full overflow-hidden", isDark ? "bg-white/10" : "bg-slate-100")}>
-                        <motion.div 
-                          className="h-full bg-rose-400 rounded-full" 
-                          initial={{ width: 0 }} 
-                          animate={{ width: `${activeData.bruiseIndex}%` }}
-                          transition={{ duration: 0.8, delay: 0.3 }}
-                        />
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Storage Details */}
-                  <div className="grid grid-cols-2 gap-3 mb-6">
-                    <div className={cn("p-3 rounded-xl border flex gap-3 items-center", isDark ? "bg-[#030308]/40 border-white/5" : "bg-slate-50 border-slate-200")}>
-                      <Thermometer className="w-5 h-5 text-emerald-400 shrink-0" />
+                  {expertResult?.recommendation && (
+                    <div className={cn("border rounded-xl p-3 flex gap-3", isDark ? "bg-amber-500/10 border-amber-500/20" : "bg-amber-50 border-amber-200/60")}>
+                      <div className="text-xl">💡</div>
                       <div>
-                        <p className="text-[10px] opacity-50 font-mono">STORAGE TEMP</p>
-                        <p className="text-xs font-bold">{activeData.storageTemp}</p>
+                        <p className={cn("text-[10px] font-mono opacity-60 uppercase mb-0.5", isDark ? "text-amber-400" : "text-amber-700")}>Agronomy Recommendation</p>
+                        <p className={cn("text-xs font-medium leading-relaxed", isDark ? "text-amber-200" : "text-amber-900")}>
+                          {expertResult.recommendation}
+                        </p>
                       </div>
                     </div>
+                  )}
 
-                    <div className={cn("p-3 rounded-xl border flex gap-3 items-center", isDark ? "bg-[#030308]/40 border-white/5" : "bg-slate-50 border-slate-200")}>
-                      <Clock className="w-5 h-5 text-amber-400 shrink-0" />
-                      <div>
-                        <p className="text-[10px] opacity-50 font-mono">SHELF LIFE</p>
-                        <p className="text-xs font-bold">{activeData.shelfLife}</p>
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Notes Panel */}
-                  <div className={cn("p-4 rounded-xl border flex gap-3", isDark ? "bg-[#030308]/20 border-white/5" : "bg-slate-50 border-slate-200")}>
-                    <Info className="w-5 h-5 text-sky-400 shrink-0 mt-0.5" />
+                  <button
+                    onClick={() => {
+                      const sample = customResult || selectedFruit;
+                      if (!sample) return;
+                      const newItem = {
+                        name: `${sample.name || "Unknown Fruit"} ✅`,
+                        date: new Date().toLocaleDateString() + ", " + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+                        timestamp: Date.now()
+                      };
+                      setSavedFruits(prev => {
+                        if (prev.some(p => p.name === newItem.name && p.timestamp === newItem.timestamp)) return prev;
+                        return [newItem, ...prev];
+                      });
+                      setShowSavedModal(true);
+                    }}
+                    className={cn("w-full py-3 mt-2 rounded-xl text-sm font-bold border transition-colors flex items-center justify-center gap-2",
+                      isDark ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-400 hover:bg-emerald-500/20" : "bg-emerald-50 border-emerald-200 text-emerald-600 hover:bg-emerald-100"
+                    )}
+                  >
+                    <Save className="w-4 h-4" /> Save Result to Dashboard
+                  </button>
+                </motion.div>
+              ) : expertResult && !scanning && !customResult ? (
+                // --- TEXT PROMPT LAYOUT (COMPACT SYMBOLIC AI CARD) ---
+                <motion.div
+                  key="text-prompt-layout"
+                  initial={{ opacity: 0, x: 20 }}
+                  animate={{ opacity: 1, x: 0 }}
+                  exit={{ opacity: 0, x: 20 }}
+                  transition={{ duration: 0.4 }}
+                  className={cn(
+                    "p-6 rounded-3xl border backdrop-blur-xl relative overflow-hidden transition-all duration-500 shadow-xl",
+                    isDark 
+                      ? "bg-indigo-950/20 border-indigo-500/20" 
+                      : "bg-indigo-50 border-indigo-200"
+                  )}
+                >
+                  <div className="flex items-center gap-2 mb-6 border-b border-indigo-500/20 pb-4">
+                    <Sparkles className="w-6 h-6 text-indigo-400" />
                     <div>
-                      <p className="text-xs font-semibold mb-0.5">Agronomy Report Notes</p>
-                      <p className="text-[11px] opacity-75 leading-normal">{activeData.notes}</p>
+                      <h4 className="font-bold text-lg text-indigo-500 dark:text-indigo-300 tracking-tight">Symbolic AI Output</h4>
+                      <p className="text-[10px] font-mono opacity-60 uppercase">Text Analysis Result</p>
                     </div>
                   </div>
 
+                  <div className="grid grid-cols-2 gap-6 mb-6">
+                    <div>
+                      <p className="text-[11px] font-mono opacity-60 uppercase mb-1">Primary Match</p>
+                      <p className="text-3xl font-black capitalize tracking-tight bg-gradient-to-r from-indigo-500 to-purple-500 bg-clip-text text-transparent">
+                        {expertResult.fruit ? expertResult.fruit : "Unknown"}
+                      </p>
+                    </div>
+                    <div>
+                      <p className="text-[11px] font-mono opacity-60 uppercase mb-1">Confidence Limit</p>
+                      <div className="flex items-end gap-2">
+                        <span className="text-3xl font-black">{expertResult.confidence}%</span>
+                      </div>
+                      <div className={cn("w-full h-1.5 rounded-full mt-2", isDark ? "bg-indigo-900/50" : "bg-indigo-200")}>
+                        <motion.div 
+                          className="h-full bg-indigo-500 rounded-full" 
+                          initial={{ width: 0 }}
+                          animate={{ width: `${expertResult.confidence}%` }}
+                          transition={{ duration: 1, ease: "easeOut" }}
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  {expertResult.topMatches && expertResult.topMatches.length > 0 && (
+                    <div className="mb-6">
+                      <p className="text-[10px] font-mono opacity-60 uppercase mb-3 flex items-center gap-1">
+                        <Layers className="w-3 h-3" /> Keyword Scoring Breakdown
+                      </p>
+                      <div className="flex flex-col gap-2">
+                        {expertResult.topMatches.map((match: any, i: number) => (
+                          <div key={i} className="flex items-center justify-between bg-indigo-500/10 px-3 py-2 rounded-lg text-sm border border-indigo-500/10">
+                            <span className="font-semibold capitalize">{match.fruit}</span>
+                            <span className="font-mono text-xs opacity-75">{match.score} points</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  <div className={cn("border rounded-2xl p-4 flex gap-4", isDark ? "bg-amber-500/10 border-amber-500/20" : "bg-amber-50 border-amber-200/60")}>
+                    <div className="text-2xl mt-1">💡</div>
+                    <div>
+                      <p className={cn("text-xs font-bold uppercase mb-1 tracking-wider", isDark ? "text-amber-400" : "text-amber-700")}>Expert Recommendation</p>
+                      <p className={cn("text-sm font-medium leading-relaxed", isDark ? "text-amber-200" : "text-amber-900")}>
+                        {expertResult.recommendation}
+                      </p>
+                    </div>
+                  </div>
                 </motion.div>
               ) : (
+                // --- EMPTY / SCANNING STATE ---
                 <div className={cn(
                   "p-8 rounded-[32px] border flex flex-col items-center justify-center min-h-[480px] backdrop-blur-xl transition-all duration-500 shadow-[0_8px_32px_0_rgba(0,0,0,0.15)] relative overflow-hidden",
-                  isDark 
-                    ? "bg-[#0b0c17]/50 border-white/[0.08]" 
-                    : "bg-white/40 border-white/30 shadow-slate-200/50"
+                  isDark ? "bg-[#0b0c17]/50 border-white/[0.08]" : "bg-white/40 border-white/30 shadow-slate-200/50"
                 )}>
-                  {/* Subtle Background Glow for CPU */}
                   <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-64 h-64 bg-emerald-500/5 rounded-full blur-[80px] pointer-events-none" />
-                  
-                  {/* The CPU Architecture Component */}
                   <div className="w-full max-w-[340px] aspect-[2/1] flex items-center justify-center mb-8 relative z-10">
-                    <CpuArchitecture text="CORE" className="w-full h-full drop-shadow-xl opacity-80 hover:opacity-100 transition-opacity duration-500" />
+                    <CpuArchitecture text={scanning ? "PROCESSING" : "CORE"} className={cn("w-full h-full drop-shadow-xl transition-all duration-500", scanning ? "opacity-100 scale-105" : "opacity-80 hover:opacity-100")} />
                   </div>
-                  
-                  <h3 className="font-bold text-lg mb-1 relative z-10">Awaiting Specimen Diagnostics</h3>
+                  <h3 className="font-bold text-lg mb-1 relative z-10">{scanning ? "Analyzing Specimen..." : "Awaiting Specimen Diagnostics"}</h3>
                   <p className="text-xs opacity-50 max-w-[280px] text-center relative z-10">
-                    Select a specimen sample or upload a photo to populate the AI ripeness dashboard instantly.
+                    {scanning ? "Neural engines are processing visual and text parameters." : "Select a specimen sample or upload a photo to populate the AI ripeness dashboard instantly."}
                   </p>
                 </div>
               )}
-            </AnimatePresence>
             </motion.div>
 
         </section>
 
-        {/* Feature Highlights Showcase */}
-        <section className="flex flex-col gap-8">
+        {/* Model Information Showcase */}
+        <section id="info" className="flex flex-col gap-8">
           <div className="text-center max-w-xl mx-auto">
-            <h2 className="text-2xl sm:text-3xl font-extrabold tracking-tight">Key Analytical Core</h2>
-            <p className={cn("text-xs mt-2", isDark ? "text-slate-400" : "text-slate-500")}>
-              Fruit Vision AI integrates three diagnostic engines to monitor visual and quality changes.
+            <h2 className="text-2xl sm:text-3xl font-extrabold tracking-tight">AI Model Specifications</h2>
+            <p className={cn("text-xs mt-2 font-medium", isDark ? "text-slate-400" : "text-slate-500")}>
+              Fruit Vision is powered by three specialized artificial intelligence engines working in tandem. 
+              <br/>
+              <span className="text-emerald-500 dark:text-emerald-400 font-bold">We will be adding support for more fruits in the upcoming future!</span>
             </p>
           </div>
 
@@ -1489,6 +1769,7 @@ export default function FruitClassificationApp() {
             }}
             className="grid grid-cols-1 md:grid-cols-3 gap-6"
           >
+            {/* Classification Model */}
             <motion.div 
               variants={{
                 hidden: { opacity: 0, y: 30 },
@@ -1504,12 +1785,16 @@ export default function FruitClassificationApp() {
               <div className="w-10 h-10 rounded-lg bg-emerald-500/10 flex items-center justify-center text-emerald-400">
                 <Layers className="w-5 h-5" />
               </div>
-              <h3 className="font-bold text-sm">Hyperspectral Skin Profiling</h3>
-              <p className="text-xs opacity-70 leading-normal">
-                Analyzes skin pigments across multiple wavelength segments to detect subsurface bruises and tissue decay invisible to the naked eye.
+              <h3 className="font-bold text-sm">Image Classification Engine</h3>
+              <p className="text-xs opacity-70 leading-normal mb-2">
+                Our primary neural network used for identifying uploaded photos and tracking via live camera feed.
               </p>
+              <div className="mt-auto inline-flex items-center gap-2 bg-emerald-500/10 text-emerald-500 px-3 py-1.5 rounded-lg w-fit text-xs font-bold border border-emerald-500/20">
+                Trained on 40+ Fruits
+              </div>
             </motion.div>
 
+            {/* Detection Model */}
             <motion.div 
               variants={{
                 hidden: { opacity: 0, y: 30 },
@@ -1523,14 +1808,18 @@ export default function FruitClassificationApp() {
               )}
             >
               <div className="w-10 h-10 rounded-lg bg-amber-500/10 flex items-center justify-center text-amber-400">
-                <TrendingUp className="w-5 h-5" />
+                <Scan className="w-5 h-5" />
               </div>
-              <h3 className="font-bold text-sm">Starch-Sugar Shift Engine</h3>
-              <p className="text-xs opacity-70 leading-normal">
-                Estimates estimated fruit Brix levels based on shape deformation, skin coloring distribution, and cell turgidity metrics.
+              <h3 className="font-bold text-sm">Real-Time Detection YOLO</h3>
+              <p className="text-xs opacity-70 leading-normal mb-2">
+                A blazing-fast YOLOv8 object detection model that instantly draws bounding boxes around multiple fruits at once.
               </p>
+              <div className="mt-auto inline-flex items-center gap-2 bg-amber-500/10 text-amber-500 px-3 py-1.5 rounded-lg w-fit text-xs font-bold border border-amber-500/20">
+                Trained on 6 Fruits
+              </div>
             </motion.div>
 
+            {/* Symbolic AI */}
             <motion.div 
               variants={{
                 hidden: { opacity: 0, y: 30 },
@@ -1544,12 +1833,15 @@ export default function FruitClassificationApp() {
               )}
             >
               <div className="w-10 h-10 rounded-lg bg-rose-500/10 flex items-center justify-center text-rose-400">
-                <Cpu className="w-5 h-5" />
+                <Sparkles className="w-5 h-5" />
               </div>
-              <h3 className="font-bold text-sm">Neural Ripeness Classifier</h3>
-              <p className="text-xs opacity-70 leading-normal">
-                Uses customized residual neural networks trained on over 250,000 agricultural fruit datasets to match ripeness standards.
+              <h3 className="font-bold text-sm">Symbolic Logic AI Engine</h3>
+              <p className="text-xs opacity-70 leading-normal mb-2">
+                A rule-based expert system that analyzes descriptive text inputs to deduce the fruit using specific characteristics.
               </p>
+              <div className="mt-auto inline-flex items-center gap-2 bg-rose-500/10 text-rose-500 px-3 py-1.5 rounded-lg w-fit text-xs font-bold border border-rose-500/20">
+                Trained on 50 Fruits
+              </div>
             </motion.div>
           </motion.div>
         </section>
@@ -1558,9 +1850,47 @@ export default function FruitClassificationApp() {
 
       {/* Footer */}
       <footer className={cn(
-        "border-t py-12 mt-16 transition-colors duration-300 relative z-10 overflow-hidden",
+        "border-t py-28 mt-24 transition-colors duration-300 relative z-10 overflow-hidden",
         isDark ? "bg-[#030308]/90 border-white/5" : "bg-white border-slate-200"
       )}>
+        {/* Full-width Grass Pattern */}
+        <div className="absolute bottom-0 left-0 w-full h-16 pointer-events-none z-0">
+          <svg width="100%" height="100%" preserveAspectRatio="none">
+            <defs>
+              <pattern id="grass-pattern" x="0" y="0" width="80" height="64" patternUnits="userSpaceOnUse">
+                {/* Back Layer (Darker, Thinner, Shorter) */}
+                <g className={isDark ? "opacity-20" : "opacity-30"}>
+                  <path d="M2 64 Q 5 58 1 54" stroke={isDark ? "#059669" : "#047857"} strokeWidth="1" fill="none" strokeLinecap="round" />
+                  <path d="M8 64 Q 8 57 12 52" stroke={isDark ? "#059669" : "#047857"} strokeWidth="1.5" fill="none" strokeLinecap="round" />
+                  <path d="M15 64 Q 10 58 18 55" stroke={isDark ? "#059669" : "#047857"} strokeWidth="1" fill="none" strokeLinecap="round" />
+                  <path d="M22 64 Q 25 55 20 50" stroke={isDark ? "#059669" : "#047857"} strokeWidth="1.5" fill="none" strokeLinecap="round" />
+                  <path d="M30 64 Q 28 58 35 53" stroke={isDark ? "#059669" : "#047857"} strokeWidth="1" fill="none" strokeLinecap="round" />
+                  <path d="M38 64 Q 42 56 37 51" stroke={isDark ? "#059669" : "#047857"} strokeWidth="1.5" fill="none" strokeLinecap="round" />
+                  <path d="M45 64 Q 45 55 50 52" stroke={isDark ? "#059669" : "#047857"} strokeWidth="1" fill="none" strokeLinecap="round" />
+                  <path d="M55 64 Q 50 58 58 55" stroke={isDark ? "#059669" : "#047857"} strokeWidth="1.5" fill="none" strokeLinecap="round" />
+                  <path d="M62 64 Q 65 54 60 49" stroke={isDark ? "#059669" : "#047857"} strokeWidth="1.5" fill="none" strokeLinecap="round" />
+                  <path d="M70 64 Q 68 58 75 55" stroke={isDark ? "#059669" : "#047857"} strokeWidth="1" fill="none" strokeLinecap="round" />
+                  <path d="M78 64 Q 78 55 82 50" stroke={isDark ? "#059669" : "#047857"} strokeWidth="1.5" fill="none" strokeLinecap="round" />
+                </g>
+                {/* Front Layer (Lighter, Thicker, Taller) */}
+                <g className={isDark ? "opacity-40" : "opacity-70"}>
+                  <path d="M0 64 Q 5 56 4 48" stroke={isDark ? "#10b981" : "#059669"} strokeWidth="2" fill="none" strokeLinecap="round" />
+                  <path d="M10 64 Q 5 58 15 50" stroke={isDark ? "#10b981" : "#059669"} strokeWidth="2.5" fill="none" strokeLinecap="round" />
+                  <path d="M18 64 Q 22 55 16 47" stroke={isDark ? "#10b981" : "#059669"} strokeWidth="2" fill="none" strokeLinecap="round" />
+                  <path d="M26 64 Q 24 58 30 52" stroke={isDark ? "#10b981" : "#059669"} strokeWidth="2.5" fill="none" strokeLinecap="round" />
+                  <path d="M35 64 Q 40 54 32 46" stroke={isDark ? "#10b981" : "#059669"} strokeWidth="3" fill="none" strokeLinecap="round" />
+                  <path d="M42 64 Q 38 56 48 50" stroke={isDark ? "#10b981" : "#059669"} strokeWidth="2" fill="none" strokeLinecap="round" />
+                  <path d="M50 64 Q 55 58 52 48" stroke={isDark ? "#10b981" : "#059669"} strokeWidth="2.5" fill="none" strokeLinecap="round" />
+                  <path d="M60 64 Q 58 54 65 47" stroke={isDark ? "#10b981" : "#059669"} strokeWidth="2" fill="none" strokeLinecap="round" />
+                  <path d="M68 64 Q 72 58 66 52" stroke={isDark ? "#10b981" : "#059669"} strokeWidth="3" fill="none" strokeLinecap="round" />
+                  <path d="M75 64 Q 70 56 78 48" stroke={isDark ? "#10b981" : "#059669"} strokeWidth="2.5" fill="none" strokeLinecap="round" />
+                </g>
+              </pattern>
+            </defs>
+            <rect x="0" y="0" width="100%" height="100%" fill="url(#grass-pattern)" />
+          </svg>
+        </div>
+
         {/* Animated Background Tree Graphic */}
         <div className="absolute bottom-0 left-1/2 -translate-x-1/2 opacity-100 dark:opacity-40 pointer-events-none">
           <style dangerouslySetInnerHTML={{__html: `
@@ -1618,10 +1948,48 @@ export default function FruitClassificationApp() {
                <circle cx="210" cy="198" r="5" fill="#ffbe76" />
             </g>
           </svg>
+
+          {/* Dev 1: Souvik (Apple attached to left branch) */}
+          <a 
+            href="https://github.com/souvikvos" 
+            target="_blank" 
+            rel="noopener noreferrer" 
+            className="group absolute flex items-center justify-center pointer-events-auto"
+            style={{ left: "113px", top: "45px" }}
+          >
+            <div className="absolute inset-0 bg-rose-500/30 blur-xl rounded-full scale-0 group-hover:scale-150 transition-transform duration-500" />
+            <div className="relative w-10 h-10 rounded-full bg-gradient-to-br from-white to-rose-50 dark:from-slate-800 dark:to-slate-900 border-2 border-rose-200 dark:border-rose-900/50 flex items-center justify-center shadow-sm group-hover:shadow-[0_0_25px_rgba(244,63,94,0.5)] transition-all duration-300 group-hover:-translate-y-2 group-hover:border-rose-400 z-10 animate-[bounce_3s_infinite_ease-in-out]">
+              <span className="text-2xl transition-transform duration-300 group-hover:scale-125 group-hover:-rotate-12 drop-shadow-sm">🍎</span>
+            </div>
+            <div className="absolute -top-14 opacity-0 group-hover:opacity-100 transition-all duration-300 translate-y-4 group-hover:-translate-y-0 bg-gradient-to-r from-rose-500 to-rose-600 text-white px-3 py-2 rounded-xl text-xs whitespace-nowrap font-bold shadow-xl shadow-rose-500/20 pointer-events-none flex items-center gap-2 z-20 border border-rose-400/50">
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5"><path d="M15 22v-4a4.8 4.8 0 0 0-1-3.5c3 0 6-2 6-5.5.08-1.25-.27-2.48-1-3.5.28-1.15.28-2.35 0-3.5 0 0-1 0-3 1.5-2.64-.5-5.36-.5-8 0C6 2 5 2 5 2c-.3 1.15-.3 2.35 0 3.5A5.403 5.403 0 0 0 4 9c0 3.5 3 5.5 6 5.5-.39.49-.68 1.05-.85 1.65-.17.6-.22 1.23-.15 1.85v4"/><path d="M9 18c-4.51 2-5-2-7-2"/></svg>
+              Souvik Ghosh
+              <div className="absolute -bottom-1.5 left-1/2 -translate-x-1/2 w-3 h-3 bg-rose-600 rotate-45 border-b border-r border-rose-400/50" />
+            </div>
+          </a>
+
+          {/* Dev 2: Soyam (Orange attached to right branch) */}
+          <a 
+            href="https://github.com/yo-soyam" 
+            target="_blank" 
+            rel="noopener noreferrer" 
+            className="group absolute flex items-center justify-center pointer-events-auto"
+            style={{ left: "246px", top: "45px" }}
+          >
+            <div className="absolute inset-0 bg-orange-500/30 blur-xl rounded-full scale-0 group-hover:scale-150 transition-transform duration-500" />
+            <div className="relative w-10 h-10 rounded-full bg-gradient-to-br from-white to-orange-50 dark:from-slate-800 dark:to-slate-900 border-2 border-orange-200 dark:border-orange-900/50 flex items-center justify-center shadow-sm group-hover:shadow-[0_0_25px_rgba(249,115,22,0.5)] transition-all duration-300 group-hover:-translate-y-2 group-hover:border-orange-400 z-10 animate-[bounce_3.5s_infinite_ease-in-out]">
+              <span className="text-2xl transition-transform duration-300 group-hover:scale-125 group-hover:rotate-12 drop-shadow-sm">🍊</span>
+            </div>
+            <div className="absolute -top-14 opacity-0 group-hover:opacity-100 transition-all duration-300 translate-y-4 group-hover:-translate-y-0 bg-gradient-to-r from-orange-500 to-orange-600 text-white px-3 py-2 rounded-xl text-xs whitespace-nowrap font-bold shadow-xl shadow-orange-500/20 pointer-events-none flex items-center gap-2 z-20 border border-orange-400/50">
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5"><path d="M15 22v-4a4.8 4.8 0 0 0-1-3.5c3 0 6-2 6-5.5.08-1.25-.27-2.48-1-3.5.28-1.15.28-2.35 0-3.5 0 0-1 0-3 1.5-2.64-.5-5.36-.5-8 0C6 2 5 2 5 2c-.3 1.15-.3 2.35 0 3.5A5.403 5.403 0 0 0 4 9c0 3.5 3 5.5 6 5.5-.39.49-.68 1.05-.85 1.65-.17.6-.22 1.23-.15 1.85v4"/><path d="M9 18c-4.51 2-5-2-7-2"/></svg>
+              Soyam Bhalotia
+              <div className="absolute -bottom-1.5 left-1/2 -translate-x-1/2 w-3 h-3 bg-orange-600 rotate-45 border-b border-r border-orange-400/50" />
+            </div>
+          </a>
         </div>
 
-        <div className="max-w-7xl mx-auto px-6 flex flex-col md:flex-row items-center justify-between gap-6 relative z-10">
-          <div className="flex items-center gap-3 bg-white/5 dark:bg-black/20 p-2 pr-4 rounded-xl backdrop-blur-md border border-slate-200 dark:border-white/10">
+        <div className="max-w-7xl mx-auto px-6 flex flex-col md:flex-row items-center justify-between gap-6 relative z-10 pointer-events-none">
+          <div className="flex items-center gap-3 bg-white/5 dark:bg-black/20 p-2 pr-4 rounded-xl backdrop-blur-md border border-slate-200 dark:border-white/10 pointer-events-auto">
             <div className="flex items-center justify-center mr-1">
               <svg width="22" height="22" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className="drop-shadow-sm">
                 <circle cx="12" cy="15" r="7" stroke="#00df81" strokeWidth="2.5" />
@@ -1633,9 +2001,9 @@ export default function FruitClassificationApp() {
             <span className="font-extrabold text-xs tracking-wider uppercase">FRUIT VISION AI</span>
           </div>
 
-          <p className="text-[11px] opacity-70 font-mono text-center md:text-right bg-white/5 dark:bg-black/20 px-4 py-2 rounded-lg backdrop-blur-md border border-slate-200 dark:border-white/10">
+          <div className="text-[11px] opacity-70 font-mono text-center md:text-right bg-white/5 dark:bg-black/20 px-4 py-2 rounded-lg backdrop-blur-md border border-slate-200 dark:border-white/10 pointer-events-auto">
             Made with passion by Souvik Ghosh and Soyam Bhalotia
-          </p>
+          </div>
         </div>
       </footer>
       </div>
@@ -1682,32 +2050,28 @@ export default function FruitClassificationApp() {
               <h3 className="font-extrabold text-lg tracking-tight mb-1 flex items-center gap-2">
                 <ShieldCheck className="w-5 h-5 text-emerald-400" /> Saved Specimens
               </h3>
-              <p className="text-xs opacity-50 mb-6">Grades, Freshness and Ripeness certificates recorded on local nodes.</p>
+              <p className="text-xs opacity-50 mb-6">Specimens recorded on local nodes.</p>
 
               {/* Items List */}
               <div className="flex flex-col gap-3">
-                {[
-                  { name: "Honeycrisp Apple 🍎", date: "Today, 10:24 AM", score: "92% Fresh", grade: "Export Optimal" },
-                  { name: "Cavendish Banana 🍌", date: "Yesterday, 3:15 PM", score: "85% Ripe", grade: "Domestic Grade" },
-                  { name: "Alphonso Mango 🥭", date: "May 26, 4:40 PM", score: "88% Optimal", grade: "Export Optimal" }
-                ].map((item, idx) => (
+                {savedFruits.length > 0 ? savedFruits.map((item, idx) => (
                   <div 
                     key={idx}
                     className={cn(
                       "p-4 rounded-2xl border flex items-center justify-between transition-all duration-300",
-                      isDark ? "bg-white/[0.03] border-white/5" : "bg-slate-50 border-slate-100"
+                      isDark ? "bg-white/[0.03] border-white/5 hover:bg-white/[0.06]" : "bg-slate-50 border-slate-100 hover:bg-slate-100"
                     )}
                   >
                     <div>
                       <h4 className="font-bold text-sm">{item.name}</h4>
                       <p className="text-[10px] opacity-40 mt-0.5">{item.date}</p>
                     </div>
-                    <div className="text-right">
-                      <span className="text-xs font-mono font-bold text-emerald-400 block">{item.score}</span>
-                      <span className="text-[10px] opacity-50 block">{item.grade}</span>
-                    </div>
                   </div>
-                ))}
+                )) : (
+                  <div className="py-12 text-center opacity-50 text-sm">
+                    No specimens saved yet. Run an analysis and click "Save Result".
+                  </div>
+                )}
               </div>
             </motion.div>
           </div>
@@ -1846,15 +2210,15 @@ export default function FruitClassificationApp() {
             
             {/* Modal box */}
             <motion.div 
-              initial={{ opacity: 0, scale: 0.95, y: 30 }}
+              initial={{ opacity: 0, scale: 0.9, y: 40 }}
               animate={{ opacity: 1, scale: 1, y: 0 }}
-              exit={{ opacity: 0, scale: 0.95, y: 30 }}
-              transition={{ type: "spring", duration: 0.5 }}
+              exit={{ opacity: 0, scale: 0.9, y: 40 }}
+              transition={{ type: "spring", damping: 25, stiffness: 300 }}
               className={cn(
-                "relative w-full max-w-lg p-6 rounded-[32px] border shadow-[0_24px_50px_rgba(0,0,0,0.4)] overflow-hidden z-10",
+                "relative w-full max-w-xl p-7 rounded-[32px] border overflow-hidden z-10 shadow-[0_0_80px_-15px_rgba(52,211,153,0.15)] backdrop-blur-2xl",
                 isDark 
-                  ? "bg-[#0b0c17]/95 border-white/10 text-white" 
-                  : "bg-white/95 border-slate-200 text-slate-800"
+                  ? "bg-[#0b0c17]/80 border-emerald-500/20 text-white ring-1 ring-white/5" 
+                  : "bg-white/90 border-emerald-500/20 text-slate-800 ring-1 ring-black/5"
               )}
             >
               {/* Close Button */}
@@ -1865,20 +2229,47 @@ export default function FruitClassificationApp() {
                 <X className="w-5 h-5" />
               </button>
 
-              <h3 className="font-extrabold text-lg tracking-tight mb-1 flex items-center gap-2">
-                <Camera className="w-5 h-5 text-emerald-400" /> Fruit Vision Hyperspectral Camera
+              <h3 className="font-extrabold text-2xl tracking-tight mb-1 flex items-center gap-3">
+                <div className="p-2 bg-emerald-500/10 rounded-xl ring-1 ring-emerald-500/20">
+                  <Camera className="w-5 h-5 text-emerald-400" /> 
+                </div>
+                <span className="bg-gradient-to-r from-emerald-400 to-cyan-400 bg-clip-text text-transparent drop-shadow-sm">
+                  Fruit Vision Camera
+                </span>
               </h3>
-              <p className="text-xs opacity-50 mb-4">Aim viewfinder at the specimen fruit for spectral scanning analysis.</p>
+              <p className="text-sm opacity-60 mb-6 font-medium pl-12">Initialize live AI tracking to scan specimen.</p>
 
               {/* Viewfinder Frame */}
-              <div className="relative aspect-video w-full rounded-2xl bg-black overflow-hidden border border-white/10 shadow-inner flex items-center justify-center mb-5">
+              <div className="relative aspect-video w-full rounded-[24px] bg-black overflow-hidden border border-emerald-500/30 shadow-[0_0_30px_rgba(52,211,153,0.1)] flex items-center justify-center mb-6 ring-1 ring-white/5">
                 {cameraStream ? (
-                  <video 
-                    ref={videoRef} 
-                    autoPlay 
-                    playsInline 
-                    className="w-full h-full object-cover"
-                  />
+                  <>
+                    <video 
+                      ref={videoRef} 
+                      autoPlay 
+                      playsInline 
+                      className="w-full h-full object-cover"
+                    />
+                    <canvas
+                      ref={canvasRef}
+                      width={640}
+                      height={480}
+                      className="absolute inset-0 w-full h-full pointer-events-none"
+                    />
+                    
+                    {/* Live Classification HUD Overlay */}
+                    {isLiveScanning && selectedModel === "classification" && liveClassResult && (
+                      <div className="absolute top-4 left-4 right-4 flex justify-center">
+                        <div className="bg-black/70 backdrop-blur-md border border-emerald-500/30 px-6 py-3 rounded-2xl flex flex-col items-center shadow-lg">
+                           <span className="text-white font-extrabold text-xl tracking-tight drop-shadow-md">
+                             {liveClassResult.className}
+                           </span>
+                           <span className="text-emerald-400 font-mono text-xs font-bold mt-1">
+                             CONFIDENCE: {(liveClassResult.confidence * 100).toFixed(1)}%
+                           </span>
+                        </div>
+                      </div>
+                    )}
+                  </>
                 ) : (
                   // Fallback Mock Scanner Viewfinder Grid Animation
                   <div className="absolute inset-0 flex flex-col items-center justify-center bg-[#05050a]">
@@ -1920,12 +2311,24 @@ export default function FruitClassificationApp() {
                   </div>
                 )}
 
-                {/* Laser crosshair watermark overlaid on top of video stream */}
+                {/* Sci-Fi Reticle Watermark overlaid on top of video stream */}
                 {cameraStream && (
-                  <div className="absolute inset-0 pointer-events-none flex items-center justify-center">
-                    <div className="w-24 h-24 border border-rose-500/40 rounded-full flex items-center justify-center animate-pulse">
-                      <div className="w-2 h-2 rounded-full bg-rose-500/60" />
-                    </div>
+                  <div className="absolute inset-0 pointer-events-none flex items-center justify-center mix-blend-screen opacity-60">
+                    <motion.div 
+                      animate={{ rotate: 360 }}
+                      transition={{ repeat: Infinity, duration: 20, ease: "linear" }}
+                      className="relative w-48 h-48 border border-emerald-500/30 rounded-full flex items-center justify-center"
+                    >
+                      <div className="w-40 h-40 border border-dashed border-emerald-500/40 rounded-full animate-pulse flex items-center justify-center">
+                         <div className="w-2 h-2 rounded-full bg-emerald-400 shadow-[0_0_10px_#34d399]" />
+                      </div>
+                      
+                      {/* Targeting Brackets */}
+                      <div className="absolute top-0 left-1/2 -translate-x-1/2 w-4 h-1 bg-emerald-500/80" />
+                      <div className="absolute bottom-0 left-1/2 -translate-x-1/2 w-4 h-1 bg-emerald-500/80" />
+                      <div className="absolute left-0 top-1/2 -translate-y-1/2 w-1 h-4 bg-emerald-500/80" />
+                      <div className="absolute right-0 top-1/2 -translate-y-1/2 w-1 h-4 bg-emerald-500/80" />
+                    </motion.div>
                   </div>
                 )}
               </div>
@@ -1937,20 +2340,39 @@ export default function FruitClassificationApp() {
               )}
 
               {/* Action Buttons */}
-              <div className="flex items-center gap-3">
-                <button
-                  onClick={stopCamera}
-                  className="flex-1 py-3 px-4 rounded-xl text-xs font-bold transition-all border border-slate-200 hover:bg-slate-100 dark:border-white/10 dark:hover:bg-white/5 cursor-pointer"
-                >
-                  Cancel
-                </button>
-                <button
-                  onClick={handleCapture}
-                  className="flex-1 py-3 px-4 rounded-xl text-xs font-bold text-white bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-600 hover:to-teal-600 shadow-md hover:shadow-lg transition-all active:scale-[0.98] cursor-pointer flex items-center justify-center gap-2"
-                >
-                  <Sparkles className="w-4 h-4" />
-                  Capture Specimen
-                </button>
+              <div className="flex flex-col gap-3">
+                {cameraStream && (
+                  <button
+                    onClick={toggleLiveScan}
+                    className={cn(
+                      "w-full py-4 px-6 rounded-2xl text-sm font-extrabold text-white shadow-lg transition-all active:scale-[0.98] cursor-pointer flex items-center justify-center gap-3 overflow-hidden relative group",
+                      isLiveScanning 
+                        ? "bg-rose-500 hover:bg-rose-600 shadow-rose-500/30" 
+                        : "bg-emerald-500 hover:bg-emerald-600 shadow-emerald-500/30"
+                    )}
+                  >
+                    <div className="absolute inset-0 bg-gradient-to-r from-transparent via-white/20 to-transparent -translate-x-[150%] group-hover:translate-x-[150%] transition-transform duration-700 ease-in-out" />
+                    <Scan className={cn("w-5 h-5", isLiveScanning && "animate-pulse")} />
+                    {isLiveScanning ? "STOP LIVE TRACKING" : "START LIVE TRACKING"}
+                  </button>
+                )}
+                
+                <div className="flex items-center gap-3">
+                  <button
+                    onClick={stopCamera}
+                    className="flex-1 py-3 px-4 rounded-xl text-xs font-bold transition-all border border-slate-200 hover:bg-slate-100 dark:border-white/10 dark:hover:bg-white/10 dark:bg-black/20 backdrop-blur-md cursor-pointer"
+                  >
+                    Close Camera
+                  </button>
+                  <button
+                    onClick={handleCapture}
+                    disabled={isLiveScanning}
+                    className="flex-1 py-3 px-4 rounded-xl text-xs font-bold text-slate-300 bg-white/5 border border-white/10 hover:bg-white/10 hover:text-white shadow-sm transition-all active:scale-[0.98] cursor-pointer flex items-center justify-center gap-2 disabled:opacity-30 disabled:cursor-not-allowed backdrop-blur-md"
+                  >
+                    <Camera className="w-4 h-4" />
+                    Snapshot Mock
+                  </button>
+                </div>
               </div>
             </motion.div>
           </div>
