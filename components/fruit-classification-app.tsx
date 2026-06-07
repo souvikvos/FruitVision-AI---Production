@@ -30,6 +30,7 @@ import { cn } from "@/lib/utils";
 import { CpuArchitecture } from "./ui/cpu-architecture";
 import { detectFruit } from '@/lib/expert-system/logicEngine';
 import { runDetection, runClassification, initOnnxSessions } from '@/lib/onnxEngine';
+import { client } from '@gradio/client';
 
 // Interface for predefined fruits in the classification system
 interface FruitSample {
@@ -591,13 +592,14 @@ export default function FruitClassificationApp() {
       setYoloImageLoaded(false);
 
       try {
-        const endpoint = selectedModel === "detection" ? '/api/detect' : '/api/classify';
-        const response = await fetch(endpoint, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ image: base64Image })
-        });
-        const result = await response.json();
+        const spaceName = selectedModel === "detection" ? "souvikvos/fruitvision-detector" : "souvikvos/fruitvision-classifier";
+        const endpoint = selectedModel === "detection" ? "/predict" : "/classify_fruit";
+        
+        // Connect directly to HF Space from browser (bypassing Vercel 10s timeout)
+        const app = await client(spaceName);
+        const predictionResult = await app.predict(endpoint, [file as File]);
+        
+        const result = { success: true, data: predictionResult.data as any[] };
         
         if (result.success && result.data && result.data.length > 0) {
             let detectedName = "Unknown";
