@@ -1327,7 +1327,10 @@ export default function FruitClassificationApp() {
                     type="text"
                     value={prompt}
                     onChange={(e) => setPrompt(e.target.value)}
-                    className="w-full bg-transparent text-sm outline-none border-none text-slate-800 dark:text-slate-100 z-10"
+                    className={cn(
+                      "w-full bg-transparent text-sm outline-none border-none z-10",
+                      isDark ? "text-white" : "text-slate-800"
+                    )}
                   />
                 </div>
                 
@@ -2117,7 +2120,10 @@ export default function FruitClassificationApp() {
                   placeholder="Search chat history..."
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
-                  className="flex-1 bg-transparent border-none outline-none text-sm placeholder:text-slate-500"
+                  className={cn(
+                    "flex-1 bg-transparent border-none outline-none text-sm placeholder:text-slate-500",
+                    isDark ? "text-white" : "text-slate-800"
+                  )}
                   autoFocus
                 />
                 <button 
