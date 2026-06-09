@@ -593,7 +593,7 @@ export default function FruitClassificationApp() {
 
       try {
         const spaceName = selectedModel === "detection" ? "souvikvos/fruitvision-detector" : "souvikvos/fruitvision-classifier";
-        const endpoint = selectedModel === "detection" ? "/predict" : "/classify_fruit";
+        const endpoint = selectedModel === "detection" ? "/detect_fruits" : "/classify_fruit";
         
         // Connect directly to HF Space from browser (bypassing Vercel 10s timeout)
         const app = await client(spaceName);
